@@ -119,7 +119,7 @@ def scrape_walgreens_promotions_selenium():
             print("No products found on the page.")
             return []
 
-        products = products_list.find_all('li', class_='item owned-brands')[:10]  # Limit to 10 products
+        products = products_list.find_all('li', class_='item owned-brands')
         walgreens_products = []
 
         for product in products:
