@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, ARRAY, Index, DateTime, func
+from sqlalchemy import Column, Integer, String, ForeignKey, ARRAY, Index, DateTime, Boolean, func
 from sqlalchemy.orm import relationship, declarative_base
 
 Base = declarative_base()
@@ -12,6 +12,8 @@ class Product(Base):
     image_urls = Column(ARRAY(String))  # Store image URLs as an array of strings
     product_url = Column(String, unique=True, nullable=False, index=True)  # Index on product_url
     source = Column(String, nullable=False)  # Source, e.g., 'walgreens'
+    last_seen_price = Column(String, nullable=True)  # Last seen price of the product
+    in_stock = Column(Boolean, nullable=False, default=False)  # Whether the product is in stock
 
     # Timestamps
     created_date = Column(DateTime, default=func.now(), nullable=False)

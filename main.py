@@ -13,8 +13,9 @@ from selenium.webdriver.common.keys import Keys
 import time
 import re
 import os
+from sqlalchemy.orm import joinedload
+from urllib.parse import unquote, urlparse, parse_qs
 
-# Import the models and session setup from the previous explanation
 from app.models import Product, AmazonProduct, ProductMatch
 from app.db import SessionLocal
 
@@ -23,8 +24,21 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 
 
 def extract_asin(url):
+    # Try to extract ASIN directly from the path
     match = re.search(r'/([A-Z0-9]{10})(?:[/?]|$)', url)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1)
+
+    # If no match, check if ASIN is inside query parameters
+    parsed_url = urlparse(url)
+    query_params = parse_qs(parsed_url.query)
+    if 'url' in query_params:
+        decoded_url = unquote(query_params['url'][0])
+        match = re.search(r'/([A-Z0-9]{10})(?:[/?]|$)', decoded_url)
+        if match:
+            return match.group(1)
+
+    return None
 
 # Function to search for the product on Amazon and return an array with URLs, titles, and image URLs for the first 10 results
 def search_amazon_with_selenium(product):
@@ -88,7 +102,7 @@ def search_amazon_with_selenium(product):
         driver.close()
 
 # Function to scrape Walgreens promotions using Selenium
-def scrape_walgreens_promotions_selenium():
+def scrape_walgreens_promotions_selenium(target_url):
     # Initialize Selenium WebDriver with the existing Chrome session
     chrome_options = Options()
     chrome_options.debugger_address = "localhost:9222"  # Connect to running Chrome session
@@ -97,7 +111,8 @@ def scrape_walgreens_promotions_selenium():
     driver = webdriver.Chrome(options=chrome_options)
 
     # Open a new tab with Walgreens URL
-    driver.execute_script("window.open('https://www.walgreens.com/search/results.jsp?Ntt=Clearance&ban=dl_dl_Nav_9082024_', '_blank');")
+    driver.execute_script(f"window.open('{target_url}', '_blank');")
+    # driver.execute_script("window.open('https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true', '_blank');")
     # driver.execute_script("window.open('https://www.walgreens.com/search/results.jsp?Ntt=%20BD%20Alcohol%20Swabs-0%20', '_blank');")
     driver.switch_to.window(driver.window_handles[-1])
     print(f"Opened new Walgreens tab: {driver.current_url}")
@@ -122,85 +137,123 @@ def scrape_walgreens_promotions_selenium():
         products = products_list.find_all('li', class_='item owned-brands')
         walgreens_products = []
 
+        print(f"Found {len(products)} products on the page.")
+
         for product in products:
-            # Extract the product URL to navigate to the product details page
-            product_url = 'https://www.walgreens.com' + product.find('a', href=True)['href']
+            try:
+                # Extract the product URL to navigate to the product details page
+                product_url = 'https://www.walgreens.com' + product.find('a', href=True)['href']
 
-            # Check if product URL is already in the database
-            session = SessionLocal()
-            existing_product = session.query(Product).filter_by(product_url=product_url).first()
-            session.close()
+                # Check if product URL is already in the database
+                session = SessionLocal()
+                existing_product = session.query(Product).filter_by(product_url=product_url).first()
+                session.close()
 
-            if existing_product:
-                print(f"Product with URL {product_url} already exists, skipping.")
+                # Retry logic for loading the product details page
+                retries = 3
+                while retries > 0:
+                    try:
+                        # Open the product details page
+                        driver.get(product_url)
+                        wait = WebDriverWait(driver, 15)  # Set a 15-second timeout
+                        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'ul#thumbnailImages')))  # Wait for thumbnail images to load
+                        break  # Exit the retry loop if successful
+                    except Exception as e:
+                        retries -= 1
+                        print(f"Timeout reached for {product_url}. Retrying... {3 - retries} attempt(s) left.")
+                        if retries > 0:
+                            driver.refresh()  # Refresh the page and retry
+                        else:
+                            print(f"Failed to load product details page after 3 attempts. Skipping {product_url}.")
+                            continue  # Skip to the next product if retries are exhausted
+
+                # Get the page content for the product details page
+                product_content = driver.page_source
+                product_soup = BeautifulSoup(product_content, 'html.parser')
+
+                # Extract the full product name including the brand, title, and size from the h1 tag with id="productName"
+                product_name_h1 = product_soup.find('h1', id='productName')
+                title = " ".join(product_name_h1.stripped_strings) if product_name_h1 else "No title found"
+
+                # Extract prices (regular price and sale price) and clean the result
+                regular_price_div = product_soup.find('div', id='regular-price-wag-hn-lt-bold')
+                regular_price = regular_price_div.text.strip().replace('old price', '').strip() if regular_price_div else "No regular price"
+
+                sales_price_div = product_soup.find('span', id='sales-price')
+                sales_price = sales_price_div.text.strip().replace('Sale price', '').strip() if sales_price_div else "No sales price"
+
+                if existing_product:
+                    if existing_product.last_seen_price == sales_price:
+                        print(f"Product with URL {product_url} already exists and the price is the same seting as in stock.")
+                        existing_product.in_stock = True
+                        session = SessionLocal()
+                        session.add(existing_product)
+                        session.commit()
+                        session.close()
+                        continue
+                    print(f"Product with URL {product_url} already exists, updating the price.")
+                    existing_product.last_seen_price = sales_price
+                    existing_product.in_stock = True
+                    session = SessionLocal()
+                    session.add(existing_product)
+                    session.commit()
+                    session.close()
+                    continue
+
+                # Extract the image from the div you mentioned
+                image_urls = []
+                image_div = product_soup.find('div', style=lambda s: 'background-image' in s if s else False)
+                if image_div:
+                    # Extract background image URL from style attribute
+                    style = image_div['style']
+                    image_url = style.split('url(')[-1].split(')')[0].replace('"', '').replace("'", "")
+                    if image_url.startswith("//"):
+                        image_url = f"https:{image_url}"
+                    image_urls.append(image_url)
+
+                # Also extract images from the thumbnail carousel as a fallback
+                thumbnails = product_soup.find('ul', id='thumbnailImages')
+                if thumbnails:
+                    # Loop through each <li> element that contains the <img> and extract the image URLs
+                    for li in thumbnails.find_all('li'):
+                        img_tag = li.find('img')
+                        if img_tag and img_tag.get('src'):
+                            # Add https: to the image URL as it seems to be incomplete
+                            image_url = f"https:{img_tag['src']}"
+                            image_urls.append(image_url)
+
+                walgreens_product={
+                    'title': title,
+                    'price': sales_price,
+                    'image_urls': image_urls,
+                    'product_url': product_url
+                }
+
+                print(f"Product: {title}\nPrice: {sales_price}\nProduct URL: {product_url}")
+
+                walgreens_products.append(walgreens_product)
+
+                # Perform Amazon search and return the first 10 results
+                amazon_results = search_amazon_with_selenium(walgreens_product)
+                matching_indexes = find_matching_amazon_images(walgreens_product, amazon_results)
+                matching_amazon = []
+
+                for matching_index in matching_indexes:
+                    try:
+                        # print(f"Matching Amazon url: {amazon_results[matching_index-1]['url']}")
+                        matching_amazon.append(amazon_results[matching_index-1])
+                        print(f"Amazon URL: {amazon_results[matching_index-1]['url']}")
+                    except IndexError:
+                        print(f"Index {matching_index} is out of range.")
+                        pass
+
+                insert_data_to_db(walgreens_product, matching_amazon)
+                print(f"Inserted product: {title}")
+                print (10*'-')
+                time.sleep(3)
+            except Exception as e:
+                print(f"Error occurred while processing a product: {e}")
                 continue
-
-            # Open the product details page
-            driver.get(product_url)
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'ul#thumbnailImages')))  # Wait for thumbnail images to load
-
-            # Get the page content for the product details page
-            product_content = driver.page_source
-            product_soup = BeautifulSoup(product_content, 'html.parser')
-
-            # Extract the full product name including the brand, title, and size from the h1 tag with id="productName"
-            product_name_h1 = product_soup.find('h1', id='productName')
-            title = " ".join(product_name_h1.stripped_strings) if product_name_h1 else "No title found"
-
-            # Extract prices (regular price and sale price) and clean the result
-            regular_price_div = product_soup.find('div', id='regular-price-wag-hn-lt-bold')
-            regular_price = regular_price_div.text.strip().replace('old price', '').strip() if regular_price_div else "No regular price"
-
-            sales_price_div = product_soup.find('span', id='sales-price')
-            sales_price = sales_price_div.text.strip().replace('Sale price', '').strip() if sales_price_div else "No sales price"
-
-            # Extract the image from the div you mentioned
-            image_urls = []
-            image_div = product_soup.find('div', style=lambda s: 'background-image' in s if s else False)
-            if image_div:
-                # Extract background image URL from style attribute
-                style = image_div['style']
-                image_url = style.split('url(')[-1].split(')')[0].replace('"', '').replace("'", "")
-                if image_url.startswith("//"):
-                    image_url = f"https:{image_url}"
-                image_urls.append(image_url)
-
-            # Also extract images from the thumbnail carousel as a fallback
-            thumbnails = product_soup.find('ul', id='thumbnailImages')
-            if thumbnails:
-                # Loop through each <li> element that contains the <img> and extract the image URLs
-                for li in thumbnails.find_all('li'):
-                    img_tag = li.find('img')
-                    if img_tag and img_tag.get('src'):
-                        # Add https: to the image URL as it seems to be incomplete
-                        image_url = f"https:{img_tag['src']}"
-                        image_urls.append(image_url)
-
-            walgreens_product={
-                'title': title,
-                'regular_price': regular_price,
-                'sales_price': sales_price,
-                'image_urls': image_urls,  # Store as a list of image URLs
-                'product_url': product_url
-            }
-
-            walgreens_products.append(walgreens_product)
-
-            # Perform Amazon search and return the first 10 results
-            amazon_results = search_amazon_with_selenium(walgreens_product)
-            matching_indexes = find_matching_amazon_images(walgreens_product, amazon_results)
-            matching_amazon = []
-
-            for matching_index in matching_indexes:
-                try:
-                    # print(f"Matching Amazon url: {amazon_results[matching_index-1]['url']}")
-                    matching_amazon.append(amazon_results[matching_index-1])
-                except IndexError:
-                    print(f"Index {matching_index} is out of range.")
-                    pass
-
-            insert_data_to_db(walgreens_product, matching_amazon)
-            print (10*'-')
 
         return walgreens_products
 
@@ -227,7 +280,9 @@ def insert_data_to_db(product_data, amazon_data):
                 title=product_data['title'],
                 image_urls=product_data['image_urls'],
                 product_url=product_data['product_url'],
-                source='walgreens'
+                source='walgreens',
+                last_seen_price=product_data['price'],
+                in_stock=True
             )
             session.add(product)
             session.commit()
@@ -316,7 +371,7 @@ def find_matching_amazon_images(product, amazon_results):
 
     # Send the request to the OpenAI API
     response = openai.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4o-mini",
         messages=message,
         max_tokens=300,
     )
@@ -343,29 +398,51 @@ def find_matching_amazon_images(product, amazon_results):
     return matching_indexes
 
 
+
+# Function to retrieve product URLs with their related Amazon product URLs
+def get_products_with_amazon_urls(session):
+    # Query products that are in stock and have at least one Amazon product match
+    products_with_amazon = session.query(Product).filter(
+        Product.in_stock == True,  # Filter by in_stock = True
+        Product.product_matches.any()  # Ensure there is at least one match in amazon_products
+    ).options(
+        joinedload(Product.product_matches).joinedload(ProductMatch.amazon_product)
+    ).all()
+
+    result = []
+
+    # Build the result list with the product URL and the associated Amazon URLs
+    for product in products_with_amazon:
+        product_data = {
+            'product_url': product.product_url,
+            'amazon_urls': [match.amazon_product.product_url for match in product.product_matches if match.amazon_product]
+        }
+        result.append(product_data)
+
+    return result
+
 # Main function to run the script
 async def main():
-    scrape_walgreens_promotions_selenium()
+    # session = SessionLocal()
+    # products_with_amazon_urls = get_products_with_amazon_urls(session)
 
-    # for product in products:
-    #     print(f"Checking product: {product}")
-        
-    #     # Perform Amazon search and return the first 10 results
-    #     amazon_results = search_amazon_with_selenium(product)
-    #     matching_indexes = find_matching_amazon_images(product, amazon_results)
-    #     matching_amazon = []
-
-    #     for matching_index in matching_indexes:
-    #         try:
-    #             print(f"Matching Amazon url: {amazon_results[matching_index-1]['url']}")
-    #             matching_amazon.append(amazon_results[matching_index-1])
-    #         except IndexError:
-    #             print(f"Index {matching_index} is out of range.")
-    #             pass
-
-    #     insert_data_to_db(product, matching_amazon)
-    #     print (10*'-')
-
+    # for item in products_with_amazon_urls:
+    #     print(f"Product URL: {item['product_url']}")
+    #     print(f"Amazon URLs: {', '.join(item['amazon_urls'])}")
+    #     print(10*'-')
+    target_url_list = [
+        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true",
+        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=72",
+        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=144",
+        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=216",
+        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=288",
+        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=360",
+        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=432",
+        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=504",
+        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=576",
+    ]
+    for target_url in target_url_list:
+        scrape_walgreens_promotions_selenium(target_url)
 
 if __name__ == "__main__":
     asyncio.run(main())
