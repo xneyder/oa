@@ -32,6 +32,8 @@ class AmazonProduct(Base):
     title = Column(String, nullable=False)
     product_url = Column(String, unique=True, nullable=False)
     image_url = Column(String, nullable=False)
+    amazon_buy_box_count = Column(Integer)  # Number of times this product is in the Amazon buy box in the last 90 days
+    current_sellers = Column(Integer)  # Current sellers of the product
 
     # Timestamps
     created_date = Column(DateTime, default=func.now(), nullable=False)

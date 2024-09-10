@@ -15,12 +15,163 @@ import re
 import os
 from sqlalchemy.orm import joinedload
 from urllib.parse import unquote, urlparse, parse_qs
+import numpy as np
+from datetime import datetime, timedelta
+import pandas as pd
+
 
 from app.models import Product, AmazonProduct, ProductMatch
 from app.db import SessionLocal
+import keepa
+import logging
+
+# Set up logger
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
 
 # OpenAI API Key (if still needed elsewhere in the script)
 openai.api_key = os.getenv("OPENAI_API_KEY")
+
+keepa_api_key = os.getenv('KEEPA_API')
+if not keepa_api_key:
+    logger.error("Keepa API key not found in environment variables. Set the 'KEEPA_API' environment variable.")
+    raise ValueError("Keepa API key not found in environment variables. Set the 'KEEPA_API' environment variable.")
+
+logger.debug("Initializing Keepa API with the provided key.")
+keepa_api = keepa.Keepa(keepa_api_key)
+
+# Function to fetch historical data from Keepa API, including offer data
+def fetch_historical_data(asin):
+    try:
+        domain_code = 'US'  # Correct domain code for Amazon US
+        stats_days = 90  # Use 90 days of statistics
+        offers = 20  # Fetch up to 20 offers
+        days = 365  # Fetch 365 days of history
+
+        # Fetch data with the history and days parameters
+        logger.debug(f"Fetching data from Keepa for ASIN: {asin}")
+        product_data = keepa_api.query(asin, domain=domain_code, stats=stats_days, offers=offers, buybox=True, history=1, days=days)
+        
+        logger.debug(f"Data fetched for ASIN: {asin}")
+        return product_data[0] if product_data else None
+    except Exception as e:
+        logger.error(f"Error fetching data from Keepa: {e}")
+        return None
+
+
+# Convert keepa time to unix time
+def keepaTimeMinutesToUnixTime(keepaMinutes):
+    return (21564000 + int(keepaMinutes)) * 60000
+
+# Transform prices data to list
+def transformKeepaHistoryList(buy_box_seller_history):
+    return [(datetime.utcfromtimestamp(keepaTimeMinutesToUnixTime(keepaMinutes) / 1000), val) for
+                      keepaMinutes, val in zip(buy_box_seller_history[::2], buy_box_seller_history[1::2])]
+
+def fill_missing_days(df, last_n_days=90):
+    # Create a full date range from today back to last_n_days (ignoring time)
+    end_date = pd.Timestamp(datetime.utcnow().date())  # Convert to pandas Timestamp and remove time
+    start_date = end_date - timedelta(days=last_n_days)
+    all_dates = pd.date_range(start=start_date, end=end_date)
+
+    # Normalize the 'date' column to truncate to just the date (ignoring hours and minutes)
+    df['date'] = df['date'].dt.normalize()
+
+    # Drop duplicates to ensure one entry per day
+    df = df.drop_duplicates(subset='date', keep='last')
+
+    # Set the date as index for the history dataframe
+    df.set_index('date', inplace=True)
+
+    # Reindex to ensure every day is represented, fill missing seller with the previous value
+    df = df.reindex(all_dates, method='ffill').reset_index()
+    
+    # Rename columns
+    df.columns = ['date', 'seller']
+    
+    return df
+
+
+
+def get_amazon_buy_box_count(buy_box_seller_history):
+    logger.debug("Checking if Amazon held the buy box at least once in the last 90 days...")
+
+    if not buy_box_seller_history:
+        logger.debug("No buy box seller history available.")
+        return -1
+
+    # Transform history list into a dataframe
+    buyboxhistory = transformKeepaHistoryList(buy_box_seller_history)
+    df_buyboxhistory = pd.DataFrame(buyboxhistory, columns=['date', 'seller'])
+    # print(df_buyboxhistory.to_string())
+
+    # Fill in missing days and limit to the last 90 days
+    df_filled = fill_missing_days(df_buyboxhistory)
+
+    # Count how many days Amazon (ATVPDKIKX0DER) held the buy box
+    amazon_seller_id = 'ATVPDKIKX0DER'
+    amazon_buy_box_days = df_filled['seller'].value_counts().get(amazon_seller_id, 0)
+
+    logger.debug(f"Amazon held the buy box for {amazon_buy_box_days} days in the last 90 days.")
+    
+    return amazon_buy_box_days
+    
+# Analyze product based on rules
+def analyze_product(asin):
+    logger.debug(f"Analyzing product with ASIN: {asin}")
+
+    # Fetch Keepa data
+    historical_data = fetch_historical_data(asin)
+    if not historical_data:
+        logger.error("Failed to fetch historical data from Keepa.")
+        return -1, -1
+    
+    # Extract relevant information for analysis
+    stats_data = historical_data.get('stats_parsed', {})
+    buy_box_seller_history = historical_data.get('buyBoxSellerIdHistory', [])
+
+    seller_count_history = historical_data['data'].get('COUNT_NEW', [])[-90:]  # New offer count history for the last 90 days
+
+    amazon_buy_box_count = get_amazon_buy_box_count(buy_box_seller_history)
+    current_sellers = seller_count_history[-1] if len(seller_count_history) > 0 else 0
+
+    return amazon_buy_box_count, current_sellers
+
+# Function to query all records, analyze each product, and update the fields
+def analyze_and_update_products(session):
+    # Query all products where amazon_buy_box_count is NULL (i.e., unprocessed)
+    products = session.query(AmazonProduct).filter(AmazonProduct.amazon_buy_box_count.is_(None)).all()
+
+    for product in products:
+        asin = product.asin
+        logger.debug(f"Processing product with ASIN: {asin}")
+
+        # Call the analyze_product function
+        amazon_buy_box_count, current_sellers = analyze_product(asin)
+
+        # Convert numpy.int64 to native Python int
+        if isinstance(amazon_buy_box_count, np.integer):
+            amazon_buy_box_count = int(amazon_buy_box_count)
+
+        if isinstance(current_sellers, np.integer):
+            current_sellers = int(current_sellers)
+
+        print(f"Amazon buy box count: {amazon_buy_box_count}, Current sellers: {current_sellers}")
+        
+        # Check if the analysis was successful
+        if amazon_buy_box_count is not None and current_sellers is not None:
+            # Update the amazon_buy_box_count and current_sellers fields
+            product.amazon_buy_box_count = amazon_buy_box_count
+            product.current_sellers = current_sellers
+            # Commit the changes to the database
+            session.commit()
+            logger.debug(f"Updated product {asin} with buy box count {amazon_buy_box_count} and current sellers {current_sellers}")
+        else:
+            logger.error(f"Failed to update product {asin} due to missing data.")
+        time.sleep(5)
+
+    logger.info("All products have been analyzed and updated.")
+
 
 
 def extract_asin(url):
@@ -430,19 +581,26 @@ async def main():
     #     print(f"Product URL: {item['product_url']}")
     #     print(f"Amazon URLs: {', '.join(item['amazon_urls'])}")
     #     print(10*'-')
-    target_url_list = [
-        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true",
-        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=72",
-        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=144",
-        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=216",
-        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=288",
-        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=360",
-        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=432",
-        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=504",
-        "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=576",
-    ]
-    for target_url in target_url_list:
-        scrape_walgreens_promotions_selenium(target_url)
+    # target_url_list = [
+    #     "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true",
+    #     "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=72",
+    #     "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=144",
+    #     "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=216",
+    #     "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=288",
+    #     "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=360",
+    #     "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=432",
+    #     "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=504",
+    #     "https://www.walgreens.com/store/store/category/productlist.jsp?ban=dl_dlDMI_HeroREFRESH909_9082024_FlashSale_Ex20PO35&webExc=true&N=4294896499%2B1000023&Eon=4294896499&inStockOnly=true&No=576",
+    # ]
+    # for target_url in target_url_list:
+    #     scrape_walgreens_promotions_selenium(target_url)
+
+    # print(analyze_product("B0009Q64SC"))
+    # print(analyze_product("B01LB2XVDS"))
+
+    session = SessionLocal()
+    analyze_and_update_products(session)
+    
 
 if __name__ == "__main__":
     asyncio.run(main())
