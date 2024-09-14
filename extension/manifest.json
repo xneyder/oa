@@ -1,0 +1,30 @@
+{
+    "manifest_version": 3,
+    "name": "flipper",
+    "version": "1.0",
+    "description": "Get online deals to flip.",
+    "permissions": [
+      "scripting", 
+      "activeTab", 
+      "storage", 
+      "tabs", 
+      "webNavigation"
+    ],
+    "host_permissions": [
+      "https://www.cvs.com/*",
+      "https://www.amazon.com/*"
+    ],
+    "background": {
+      "service_worker": "background.js"
+    },
+    "action": {
+      "default_popup": "popup.html",
+      "default_icon": {
+        "16": "icons/icon16.jpg",
+        "32": "icons/icon32.jpg",
+        "48": "icons/icon48.jpg",
+        "128": "icons/icon128.jpg"
+      }
+    }
+  }
+  
